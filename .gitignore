@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.db
+.venv/
+node_modules/
+dist/
+.npm-cache/
+.env
+backend/data/
+
+# Local agent skills and links, not part of the app
+.agents/
+web-architecture
+website-design
+website-quality-review
