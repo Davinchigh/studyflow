@@ -25,6 +25,8 @@ DATA_DIR = Path(os.getenv("STUDY_DATA_DIR", str(BACKEND_DIR / "data")))
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
 MAX_WORKSPACES = int(os.getenv("MAX_WORKSPACES", "1000"))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "240"))
+# Hosted: a Postgres URL (e.g. Neon). Each workspace is then a schema instead of a SQLite file.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 WORKSPACE_ID = re.compile(r"^[a-f0-9]{32}$")
 
 app = FastAPI(title="Study Planner API", version="1.1.0")
@@ -36,7 +38,11 @@ _hits_lock = threading.Lock()
 
 
 def connect(path=None):
-    db = sqlite3.connect(path or current_db.get())
+    target = path or current_db.get()
+    if DATABASE_URL:
+        from .pg import Connection
+        return Connection(DATABASE_URL, target)
+    db = sqlite3.connect(target)
     db.row_factory = sqlite3.Row
     return db
 
@@ -55,8 +61,12 @@ def database(path=None):
 
 
 def initialize(path=DB_PATH):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not DATABASE_URL:
+        path.parent.mkdir(parents=True, exist_ok=True)
     with database(path) as db:
+        if DATABASE_URL:
+            db.lock(path)
+            db.create_schema()
         db.execute("""CREATE TABLE IF NOT EXISTS study_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
@@ -156,7 +166,8 @@ def seed_demo(db):
     planner.plan_for_test(db, test, today, now.isoformat())
 
 
-initialize()
+if not DATABASE_URL:
+    initialize()
 
 
 def _client_ip(request: Request) -> str:
@@ -177,7 +188,20 @@ def _rate_limited(ip: str) -> bool:
 
 
 def _workspace_db(workspace: str):
-    """Path to this workspace's database, created and seeded on first use. None when full."""
+    """This workspace's database (a SQLite path, or a Postgres schema name), created and seeded on first use. None when full."""
+    if DATABASE_URL:
+        from . import pg
+        schema = f"ws_{workspace}"
+        with _ready_lock:
+            if schema in _ready:
+                return schema
+        if not pg.workspace_exists(DATABASE_URL, schema):
+            if pg.count_workspaces(DATABASE_URL) >= MAX_WORKSPACES:
+                return None
+        initialize(schema)
+        with _ready_lock:
+            _ready.add(schema)
+        return schema
     path = DATA_DIR / f"ws_{workspace}.db"
     with _ready_lock:
         if path in _ready:
@@ -264,7 +288,7 @@ def create_focus_session(session: FocusSessionCreate):
     completed_at = datetime.now(timezone.utc).isoformat()
     with database() as db:
         db.execute(
-            "INSERT OR IGNORE INTO focus_sessions(session_key,task_title,subject,duration_minutes,completed_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO focus_sessions(session_key,task_title,subject,duration_minutes,completed_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING",
             (session.session_key, session.task_title, session.subject, session.duration_minutes, completed_at),
         )
         row = db.execute("SELECT * FROM focus_sessions WHERE session_key=?", (session.session_key,)).fetchone()
@@ -427,7 +451,7 @@ def import_calendar(payload: CalendarImport):
     with database() as db:
         for item in parsed[:2000]:
             duplicate = db.execute(
-                "SELECT 1 FROM events WHERE title=? AND kind=? AND IFNULL(date,'')=IFNULL(?,'') AND IFNULL(weekday,-1)=IFNULL(?,-1) AND IFNULL(start_time,'')=IFNULL(?,'')",
+                "SELECT 1 FROM events WHERE title=? AND kind=? AND COALESCE(date,'')=COALESCE(?,'') AND COALESCE(weekday,-1)=COALESCE(?,-1) AND COALESCE(start_time,'')=COALESCE(?,'')",
                 (item["title"], item["kind"], item["date"], item["weekday"], item["start_time"]),
             ).fetchone()
             # Past one-off events add nothing to a plan; skip them along with duplicates.
@@ -462,6 +486,8 @@ def _restore(db, snapshot):
         for row in data[table]:
             columns = ",".join(row)
             db.execute(f"INSERT INTO {table}({columns}) VALUES({','.join('?' * len(row))})", tuple(row.values()))
+        if hasattr(db, "reset_ids"):
+            db.reset_ids(table)
 
 
 @app.post("/api/assistant")
@@ -479,7 +505,8 @@ def assistant(payload: AssistantMessage):
         before = _snapshot(db)
         result = planner.handle_message(db, payload.message, date.today(), now_iso)
         if result["changed"]:
-            db.execute("INSERT OR REPLACE INTO assistant_undo(id,label,snapshot,created_at) VALUES(1,?,?,?)",
+            db.execute("DELETE FROM assistant_undo")
+            db.execute("INSERT INTO assistant_undo(id,label,snapshot,created_at) VALUES(1,?,?,?)",
                        (result["reply"].split("\n")[0][:200], before, now_iso))
         return {**result, "undoable": result["changed"]}
 
