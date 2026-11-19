@@ -17,9 +17,19 @@ Deploy the API first, because the web app needs the API's address when it is bui
   - **`RATE_LIMIT_PER_MINUTE`:** caps requests per IP address (default 240).
   - **Payload sizes:** the API validates request sizes, and calendar imports are capped at 2 MB.
 
+## Current deployment (free)
+
+- **Web app:** Vercel project `studyflow`, root `frontend`, at https://studyflow-kappa-ashen.vercel.app
+- **API:** Vercel project `studyflow-api`, root `backend` (FastAPI preset), at https://studyflow-api-eight.vercel.app
+- **Database:** Neon Postgres, free plan, project `studyflow` (aws-us-east-1). The API reads it from `DATABASE_URL`, using the pooled connection string.
+
+Both Vercel projects redeploy on every push to `main`. With `DATABASE_URL` set, each workspace is its own Postgres schema (`ws_<id>`) instead of a SQLite file. Without it, the API falls back to SQLite files, as in local development.
+
 ## 1. API
 
-Use a host that runs a Docker image and offers a **persistent disk or volume**, for example Render, Railway or Fly.io. Check each host's current plans, because persistent storage is often a paid feature. Without it, every redeploy erases all tester data.
+**Free option (current):** deploy `backend/` as a second Vercel project with the FastAPI framework preset. Set `DATABASE_URL` to a free Neon Postgres pooled connection string, and set `ALLOWED_ORIGINS`. No disk is needed.
+
+**Docker option:** use a host that runs a Docker image and offers a **persistent disk or volume**, for example Render, Railway or Fly.io. Persistent storage is usually a paid feature, and without it every redeploy erases all tester data. On Railway, also set `RAILWAY_RUN_UID=0`, because volumes mount as root and the image runs as a non-root user.
 
 1. **Create the service:** create a web service from the `backend/` folder using its `Dockerfile`.
 2. **Attach storage:** mount a persistent disk or volume at `/data`.
